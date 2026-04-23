@@ -25,3 +25,15 @@ package-lock.json
 # Misc
 _sass/vendors
 assets/js/dist
+
+# Local env
+.env
+
+# Local cache
+.DS_Store
+
+# Local logs
+logs/
+
+# Local temp
+temp/
