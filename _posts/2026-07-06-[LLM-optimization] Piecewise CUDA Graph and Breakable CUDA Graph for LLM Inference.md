@@ -753,7 +753,529 @@ The invariant is simple: downstream graph segments must read the same addresses 
 
 Invariant 很简单：下游 graph segment 必须读取 capture 时的同一批地址。开放的工程问题是如何通过 typed output-buffer API、debug address check、custom op schema 和 capture-time assertion 让这个约束可见且可强制执行。
 
-# 16. References
+# 16. Deep-Dive Notes
+
+This section keeps the more detailed engineering notes that are easy to lose in a compact article. It is intentionally more explicit and example-heavy.
+
+这一节保留更细的工程笔记。为了避免压缩文章时丢掉细节，这里会更直接、更偏例子和实现分析。
+
+## 16.1 CUDA Graph Requirements With Concrete Failure Modes
+
+CUDA Graph records a concrete GPU execution script. That script includes kernel order, launch parameters, tensor addresses, and stream dependencies. The replay path is fast because it does not redo Python, C++, dispatcher, and driver setup for every kernel.
+
+CUDA Graph 记录的是一份具体的 GPU execution script。这份 script 包含 kernel 顺序、launch 参数、tensor 地址和 stream dependency。Replay 之所以快，是因为它不需要为每个 kernel 重新走 Python、C++、dispatcher 和 driver setup。
+
+The most common failure is address instability. Suppose capture records:
+
+最常见的失败是地址不稳定。假设 capture 时记录了：
+
+```text
+input tensor address  = 0x1000
+output tensor address = 0x2000
+```
+
+If replay uses a new tensor at `0x3000`, the graph still reads from `0x1000`. The fix is not to pass arbitrary new tensors to replay. The fix is to copy new data into the original static buffers.
+
+如果 replay 时使用了位于 `0x3000` 的新 tensor，graph 仍然会从 `0x1000` 读取。解决办法不是把任意新 tensor 传给 replay，而是把新数据 copy 到原来的 static buffer。
+
+```text
+static_input_buffer  = fixed address
+static_output_buffer = fixed address
+
+each iteration:
+    copy real input -> static_input_buffer
+    replay CUDA Graph
+    read static_output_buffer
+```
+
+Shape instability is the second common failure. A graph captured for `[256, 4096]` keeps launch parameters derived from 256 tokens. It will not automatically become a 173-token graph.
+
+第二类常见失败是 shape 不稳定。为 `[256, 4096]` capture 的 graph 会保留从 256 tokens 推导出的 launch 参数。它不会自动变成 173-token graph。
+
+```text
+captured:
+    input shape = [256, 4096]
+    grid = derived from 256 x 4096
+
+runtime:
+    real input shape = [173, 4096]
+
+solution:
+    pad 173 -> 256
+    replay graph_256
+    slice output back to 173
+```
+
+The third common failure is first-time dynamic work inside capture. A Triton or Inductor kernel may compile or autotune when first called. Autotune may benchmark several configs and call synchronization for timing. That is illegal during stream capture.
+
+第三类常见失败是 capture 内部首次触发动态工作。Triton 或 Inductor kernel 第一次调用时可能 compile 或 autotune。Autotune 可能 benchmark 多个 config，并为了计时调用 synchronization。这在 stream capture 中是非法的。
+
+```python
+# Bad: first call may compile or autotune inside capture.
+with torch.cuda.graph(graph):
+    y = triton_kernel(x)
+
+# Good: warmup outside capture.
+for _ in range(3):
+    y = triton_kernel(x)
+torch.cuda.synchronize()
+
+with torch.cuda.graph(graph):
+    y_static = triton_kernel(x_static)
+```
+
+The fourth failure is hidden host-side behavior. Examples include `.item()`, `.tolist()`, CPU planning, dynamic memory allocation, file loading, `cuModuleLoadData`, or any logic that changes the set of kernels launched.
+
+第四类失败是隐藏的 host-side behavior。例如 `.item()`、`.tolist()`、CPU planning、dynamic memory allocation、file loading、`cuModuleLoadData`，或者任何会改变 kernel launch 集合的逻辑。
+
+```python
+score = score_tensor.item()  # GPU -> CPU sync
+if score > threshold:
+    run_kernel_a()
+else:
+    run_kernel_b()
+```
+
+This control flow belongs outside CUDA Graph capture, or it must be transformed into a stable graph-compatible path.
+
+这种 control flow 应该放在 CUDA Graph capture 外，或者被改写成稳定的 graph-compatible path。
+
+## 16.2 Warmup, Capture, and Replay In Real Frameworks
+
+All three frameworks use the same high-level lifecycle, but they protect different invariants.
+
+三个框架都遵循类似生命周期，但保护的 invariant 不同。
+
+```text
+warmup:
+    trigger first-run JIT/autotune/lazy init
+    allocate stable buffers/workspaces
+    prepare metadata objects
+
+capture:
+    run representative forward under torch.cuda.graph(...)
+    record stable kernel launch sequence
+
+replay:
+    copy real data into static buffers
+    update metadata content in-place
+    launch captured graph
+```
+
+vLLM is descriptor-driven. A graph descriptor contains the graph mode, token count, request count, uniform query length, and LoRA state. Full CUDA Graph uses a stricter descriptor because attention is inside the graph. Piecewise graph can relax request count more often because attention is outside the captured regions.
+
+vLLM 是 descriptor-driven。Graph descriptor 包含 graph mode、token count、request count、uniform query length 和 LoRA state。Full CUDA Graph 更严格，因为 attention 在 graph 里。Piecewise graph 通常可以更宽松，因为 attention 不在 captured regions 中。
+
+```text
+vLLM descriptor:
+    cg_mode = FULL or PIECEWISE
+    num_tokens
+    num_reqs
+    uniform_token_count
+    num_active_loras
+```
+
+For full graph capture, vLLM does a warmup forward and then creates a fresh attention state for capture. This matters for backends with lazy metadata initialization. If warmup and capture share the same metadata object, warmup may flip an initialized flag and capture may skip the initialization kernels that should have been recorded.
+
+对于 full graph capture，vLLM 会先做 warmup forward，然后为 capture 创建 fresh attention state。这对 lazy metadata initialization 的 backend 很重要。如果 warmup 和 capture 共享同一个 metadata object，warmup 可能会设置 initialized flag，导致 capture 跳过本应被记录的 initialization kernels。
+
+```text
+vLLM full graph:
+    create_forward_fn(desc, warmup=True)
+    forward_fn(NONE)          # eager warmup
+
+    create_forward_fn(desc, warmup=False)
+    with torch.cuda.graph(...):
+        forward_fn(NONE)      # capture full forward
+```
+
+SGLang separates runner and backend responsibilities. The runner chooses buckets, builds `ForwardBatch`, fills static buffers, and initializes attention metadata. The backend performs warmup and actual graph capture.
+
+SGLang 把 runner 和 backend 的职责分开。Runner 选择 bucket、构造 `ForwardBatch`、填充 static buffer，并初始化 attention metadata。Backend 执行 warmup 和真正的 graph capture。
+
+```text
+SGLang decode runner:
+    self.warmup()
+    restore seq_lens / seq_lens_cpu fill values
+    capture batch sizes from large to small
+
+per shape:
+    init_forward_metadata_out_graph(...)
+    run_once():
+        init_forward_metadata_in_graph(...)
+        model.forward(...)
+    backend.capture_one(run_once, post_warmup_hook)
+```
+
+The `post_warmup_hook`, usually `on_after_cuda_graph_warmup`, is important. It cleans up warmup-only mutations so the real capture starts from a clean state.
+
+`post_warmup_hook` 通常是 `on_after_cuda_graph_warmup`，非常重要。它会清理 warmup-only mutation，让真正的 capture 从干净状态开始。
+
+TensorRT-LLM is more controlled about when capture is allowed. Its CUDA Graph runner disables on-the-fly capture by default and uses an `allow_capture()` phase. This avoids runtime capture reallocating workspace tensors and invalidating addresses baked into already captured graphs.
+
+TensorRT-LLM 对何时允许 capture 控制更严格。它的 CUDA Graph runner 默认禁止 on-the-fly capture，而是使用 `allow_capture()` 阶段。这样可以避免 runtime capture 重新分配 workspace tensor，从而破坏已有 graph 中记录的地址。
+
+```text
+TensorRT-LLM generation graph:
+    key = (batch_size, draft_len, is_first_draft)
+    WARMUP_STEPS = 2
+    with torch.cuda.graph(graph, pool=memory_pool):
+        forward_fn(capture_inputs)
+```
+
+## 16.3 Shape Selection Details
+
+Warmup shapes should match the capture keys. Running one arbitrary dummy shape is not enough.
+
+Warmup shape 应该匹配 capture key。随便跑一个 dummy shape 不够。
+
+For vLLM, speculative decoding changes the query length:
+
+对于 vLLM，speculative decoding 会改变 query length：
+
+```text
+normal decode:
+    num_reqs = 32
+    uniform_token_count = 1
+    num_tokens = 32
+
+speculative decode:
+    num_reqs = 32
+    num_speculative_tokens = 4
+    uniform_token_count = 5
+    num_tokens = 160
+```
+
+For SGLang, `num_tokens_per_bs` changes the captured token count. Attention tensor-parallel or context-parallel constraints can filter out batch sizes that are not divisible by the required multiple.
+
+对于 SGLang，`num_tokens_per_bs` 会改变 captured token count。Attention tensor-parallel 或 context-parallel 约束可能会过滤掉不能整除所需倍数的 batch size。
+
+```text
+normal decode:
+    bs = 32
+    num_tokens_per_bs = 1
+    num_tokens = 32
+
+target verify:
+    bs = 32
+    num_tokens_per_bs = 5
+    num_tokens = 160
+```
+
+For TensorRT-LLM, generation-only graph shapes are selected from `cuda_graph_config.batch_sizes` or generated from `max_batch_size`. Piecewise graph shapes come from `torch_compile_config.capture_num_tokens`.
+
+对于 TensorRT-LLM，generation-only graph shape 来自 `cuda_graph_config.batch_sizes` 或从 `max_batch_size` 自动生成。Piecewise graph shape 来自 `torch_compile_config.capture_num_tokens`。
+
+```text
+generation-only:
+    batch_sizes = [1, 2, 4, 8, 16, 32, 64, ...]
+
+piecewise:
+    capture_num_tokens = [1, 2, 4, 8, ..., 128, 256, 512, ...]
+```
+
+Good bucket selection should come from real traffic histograms:
+
+好的 bucket selection 应该来自真实流量分布：
+
+```text
+decode batch P50 = 24
+decode batch P90 = 56
+decode batch P99 = 120
+
+reasonable decode buckets:
+    [1, 2, 4, 8, 16, 32, 64, 128]
+
+prefill token P50 = 200
+prefill token P90 = 900
+prefill token P99 = 1800
+
+reasonable token buckets:
+    [128, 256, 512, 1024, 2048]
+```
+
+## 16.4 Dummy Requests and Padding Details
+
+There are two types of dummy data.
+
+有两类 dummy data。
+
+```text
+capture-time dummy request:
+    fake batch used to warm up and capture graph
+
+runtime padding:
+    dummy rows or tokens added so a real batch fits a captured bucket
+```
+
+For decode padding:
+
+对于 decode padding：
+
+```python
+def prepare_decode_replay(real_batch, padded_bs):
+    raw_bs = real_batch.bs
+
+    input_ids.fill_(pad_token_id)
+    positions.zero_()
+    seq_lens.fill_(1)
+    is_padding.fill_(True)
+
+    input_ids[:raw_bs].copy_(real_batch.input_ids)
+    positions[:raw_bs].copy_(real_batch.positions)
+    seq_lens[:raw_bs].copy_(real_batch.seq_lens)
+    slot_mapping[:raw_bs].copy_(real_batch.slot_mapping)
+    req_pool_indices[:raw_bs].copy_(real_batch.req_pool_indices)
+
+    is_padding[:raw_bs] = False
+```
+
+Padding values must be safe. `slot_mapping = 0` is not automatically safe because KV cache slot zero may belong to a real request. Use a dummy KV slot or ensure padding rows are skipped by attention/logits logic.
+
+Padding value 必须安全。`slot_mapping = 0` 并不自动安全，因为 KV cache slot zero 可能属于真实 request。应该使用 dummy KV slot，或者确保 padding row 被 attention/logits 逻辑跳过。
+
+For piecewise graph, padding is often token-count based:
+
+对于 piecewise graph，padding 通常基于 token count：
+
+```text
+real_num_tokens = 173
+captured bucket = 256
+
+hidden_states[0:173]   = real tokens
+hidden_states[173:256] = zero or dummy padding
+```
+
+If attention runs eagerly between graph segments, it may operate only on the real tokens but must write into a static output buffer that the next graph segment already knows.
+
+如果 attention 在 graph segment 之间 eager 执行，它可以只处理真实 tokens，但必须写入下一个 graph segment 已经知道的 static output buffer。
+
+```python
+attn_out.zero_()
+attention_eager(
+    hidden_states[:raw_tokens],
+    metadata_for_raw_tokens,
+    out=attn_out[:raw_tokens],
+)
+graph1.replay()  # consumes attn_out[0:bucket]
+```
+
+## 16.5 Triton and FlashInfer Details
+
+Triton JIT and autotune belong before graph capture.
+
+Triton JIT 和 autotune 属于 graph capture 之前。
+
+```python
+# Bad: first call may compile or autotune inside capture.
+with torch.cuda.graph(graph):
+    y = triton_kernel(x)
+
+# Good: warmup first.
+for _ in range(3):
+    y = triton_kernel(x)
+torch.cuda.synchronize()
+
+with torch.cuda.graph(graph):
+    y_static = triton_kernel(x_static)
+```
+
+FlashInfer separates `plan()` and `run()`:
+
+FlashInfer 把 `plan()` 和 `run()` 分开：
+
+```text
+plan():
+    dynamic metadata planning, outside graph
+
+run():
+    GPU kernel execution, can be captured
+```
+
+Correct usage:
+
+正确用法：
+
+```python
+wrapper.plan(...)
+out.copy_(wrapper.run(q, kv_cache))
+torch.cuda.synchronize()
+
+with torch.cuda.graph(graph):
+    out.copy_(wrapper.run(q, kv_cache))
+```
+
+vLLM prepares FlashInfer decode wrappers per graph batch size for pure decode full graphs. SGLang runs FlashInfer autotune before CUDA Graph capture and scopes it around the actual kernel execution. TensorRT-LLM creates CUDA graph attention metadata before capture and requires metadata tensors to be updated in-place rather than reallocated.
+
+vLLM 会为 pure decode full graph 按 graph batch size 准备 FlashInfer decode wrapper。SGLang 在 CUDA Graph capture 前执行 FlashInfer autotune，并把 autotune 范围限制在真正的 kernel execution。TensorRT-LLM 会在 capture 前创建 CUDA graph attention metadata，并要求 metadata tensor 只能 in-place 更新，不能重新分配。
+
+## 16.6 Memory Details
+
+The largest memory consumers are usually weights and KV cache, but CUDA Graph memory can still decide whether a server has enough room for large KV cache capacity.
+
+最大显存消费者通常是 weights 和 KV cache，但 CUDA Graph memory 仍然可能决定 server 是否有足够空间容纳大 KV cache。
+
+```text
+memory ranking:
+    1. model weights
+    2. KV cache
+    3. CUDA Graph pools / static buffers / workspaces
+    4. logits and large intermediate buffers
+    5. graph executable metadata
+    6. allocator cache / fragmentation
+```
+
+KV cache per token per GPU:
+
+每个 token 每 GPU 的 KV cache：
+
+```text
+KV bytes =
+    2                         # K and V
+  * num_layers
+  * local_num_kv_heads
+  * head_dim
+  * bytes_per_element
+```
+
+For a GQA 8B model:
+
+对于一个 GQA 8B 模型：
+
+```text
+2 * 32 * 8 * 128 * 2 bytes
+= 128 KB/token
+
+100k tokens ~= 12.8 GB
+```
+
+For an MHA model with 32 KV heads:
+
+对于有 32 个 KV head 的 MHA 模型：
+
+```text
+512 KB/token
+100k tokens ~= 51.2 GB
+```
+
+A few useful buffer sizes:
+
+几个有用的 buffer 量级：
+
+```text
+hidden buffer:
+    2048 tokens * 8192 hidden * 2 bytes ~= 32 MB
+
+QKV buffer, MHA approximation:
+    3 * 2048 * 8192 * 2 ~= 96 MB
+
+MLP intermediate:
+    2048 * 28672 * 2 ~= 117 MB
+
+prefill logits:
+    2048 * 128000 * 2 ~= 500 MB
+```
+
+CUDA Graph overhead by type:
+
+按 graph 类型粗略估计：
+
+```text
+Full CUDA Graph:
+    ~100 MB to a few GB, depending on batch/logits/workspace
+
+Piecewise CUDA Graph:
+    hundreds MB to several GB, depending on token buckets and segments
+
+Breakable CUDA Graph:
+    close to full graph with few breaks
+    close to piecewise graph with many per-layer breaks
+```
+
+PyTorch caching allocator can also keep memory reserved. `expandable_segments:True` can reduce fragmentation for changing-shape workloads, while `empty_cache()` is a manual action that releases currently unused cached blocks. Neither can free live tensors, KV cache, or graph pools still referenced by active graphs.
+
+PyTorch caching allocator 也会保留 memory。`expandable_segments:True` 可以降低 changing-shape workload 的 fragmentation，而 `empty_cache()` 是手动释放当前 unused cached blocks 的动作。两者都不能释放 live tensor、KV cache，或者仍被 active graph 引用的 graph pool。
+
+## 16.7 Operator Classification Details
+
+Usually graph-friendly operators:
+
+通常 graph-friendly 的 op：
+
+```text
+RMSNorm / LayerNorm
+Linear / GEMM
+MLP
+activation
+residual add
+simple quant / dequant
+fixed-shape RoPE
+fixed-resolution ViT block
+vision projector
+```
+
+Usually graph-unfriendly operators:
+
+通常 graph-unfriendly 的 op：
+
+```text
+paged attention
+prefill attention
+mixed prefill/decode attention
+dynamic KV cache update
+KV offload / load / transfer
+scheduler logic
+sampling / logits processor
+prefix cache lookup / insert
+dynamic multimodal packing
+dynamic MoE dispatch / all-to-all
+```
+
+Conditionally graphable operators:
+
+条件性可 capture 的 op：
+
+```text
+MoE expert compute
+LoRA
+Mamba / SSM
+linear attention
+RoPE / MRoPE
+quantization / dequantization
+ViT image encoder
+speculative decoding verify path
+```
+
+The reason is not the layer name. The reason is whether shape, address, metadata, and side effects are stable.
+
+原因不在于 layer 名字，而在于 shape、地址、metadata 和 side effect 是否稳定。
+
+## 16.8 Framework-Specific Implementation Notes
+
+vLLM has full, piecewise, and breakable paths. The dispatcher decides runtime mode. The full path is best for uniform decode. The piecewise path uses compiled graph structure and CUDA Graph wrappers. The breakable path records a sequence of graph replay callables and eager callables.
+
+vLLM 有 full、piecewise 和 breakable path。Dispatcher 决定 runtime mode。Full path 最适合 uniform decode。Piecewise path 使用 compiled graph structure 和 CUDA Graph wrapper。Breakable path 记录 graph replay callable 和 eager callable 的序列。
+
+SGLang has standard decode CUDA Graph, piecewise CUDA Graph, and breakable CUDA Graph. Its runner/backend split makes bucket selection, static buffer population, metadata initialization, and backend capture more explicit.
+
+SGLang 有 standard decode CUDA Graph、piecewise CUDA Graph 和 breakable CUDA Graph。它的 runner/backend 分层让 bucket selection、static buffer population、metadata initialization 和 backend capture 更明确。
+
+TensorRT-LLM has generation-only CUDA Graph and `torch.compile`-based piecewise CUDA Graph. Publicly, it does not expose a breakable graph mechanism comparable to vLLM or SGLang. Its piecewise design relies on attention writing into graph-owned buffers.
+
+TensorRT-LLM 有 generation-only CUDA Graph 和基于 `torch.compile` 的 piecewise CUDA Graph。公开设计中，它没有暴露类似 vLLM 或 SGLang 的 breakable graph 机制。它的 piecewise 设计依赖 attention 写入 graph-owned buffer。
+
+The important pattern across all three is:
+
+三个框架共同的重要模式是：
+
+```text
+do dynamic work before capture
+capture only stable execution
+keep tensor addresses stable
+update metadata in-place
+fallback when shape or metadata path is unsupported
+```
+
 
 1. [TensorRT-LLM: Torch Compile & Piecewise CUDA Graph](https://nvidia.github.io/TensorRT-LLM/latest/features/torch_compile_and_piecewise_cuda_graph.html)
 2. [SGLang: Piecewise CUDA Graph](https://docs.sglang.io/docs/advanced_features/piecewise_cuda_graph)
